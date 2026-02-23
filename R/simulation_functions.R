@@ -1,3 +1,10 @@
+# desired update, because decompositions do not yet sum to 0.
+# 1) try different lambda for more precision
+# 2) try adding HLE to loss function
+# 3) replace pwlinear w curve (also 3 parameters). expand_hazards() should
+# have 3 options, and this requires lots of interventions.
+
+
 # ------------------------------------------------------------------------------
 # simulation_functions2.R (redux)
 #
@@ -232,7 +239,7 @@ haz_to_probs <- function(hazard, age, age_int = 1) {
 }
 
 # Multistate lifetable recursion (init defaults to c(H=1,U=0))
-calculate_lt <- function(P, init = c(H = 1, U = 0)) {
+calculate_lt <- function(P, init = c(H = 1, U = 0), age_int = 1) {
   P |>
     tidyr::pivot_longer(-c(age, from), names_to = "to", values_to = "p") |>
     dplyr::filter(.data$from != "D") |>
@@ -255,7 +262,7 @@ calculate_lt <- function(P, init = c(H = 1, U = 0)) {
     dplyr::mutate(
       prevalence = .data$lu / (.data$lh + .data$lu),
       lx         = .data$lh + .data$lu,
-      Lx         = (.data$lx + dplyr::lead(.data$lx, default = 0)) / 2
+      Lx         = age_int * (.data$lx + dplyr::lead(.data$lx, default = 0)) / 2
     )
 }
 
@@ -266,7 +273,7 @@ run_mslt <- function(pars,
                      knot_age = 75) {
   haz <- expand_hazards(pars, age = age, age_int = age_int, knot_age = knot_age)
   P   <- haz_to_probs(haz, age = age, age_int = age_int)
-  calculate_lt(P, init = init)
+  calculate_lt(P, init = init, age_int = age_int)
 }
 
 # ---------
