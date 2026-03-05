@@ -1,336 +1,268 @@
-# ------------------------------------------------------------------------------
+# simulation.R
+# Cleaned application script for multistate 'world' generation + exact snapping.
 #
-# Goal:
-#   Build a small set (5-8) of multistate "worlds" that match the same Sullivan
-#   outputs (lx, prevalence), including ~2-3 "no-return" worlds (UH ~ 0).
+# Pipeline:
+#   1) Define ground world, compute Sullivan targets (lx, prevalence).
+#   2) Find near-null directions via SVD of Jacobian of (lx, prevalence).
+#   3) Create candidate parameter sets stepping along first two near-null directions
+#      (excludes the (0,0) step by construction).
+#   4) Single-pass polish candidates with polish_many() (no second-stage refinement).
+#   5) Extract Rx(age)=ud/hd curves from polished candidates.
+#   6) For each Rx curve, compute exact RETURNS hazards by isocline snapping of (hu0,uh0).
+#   7) For each Rx curve, compute deterministic NO-RETURNS hazards.
+#   8) Bind hazards and compute lifetables via group_modify() (no purrr::map in this step).
 #
-# Method:
-#   (1) Define a ground world.
-#   (2) Compute its Sullivan outputs.
-#   (3) Find near-null directions (SVD of Jacobian of (lx, prevalence)).
-#   (4) Create candidate worlds by stepping in (dir1, dir2).
-#   (5) Polish each candidate using ridge-regularized bounded optimization.
-#       Optionally allow a small kink (piecewise log-linear hazards) 
-# with knot_age=75,
-#       while taming curvature via lambda_kink.
-#   (6) Winnow to 5-8 worlds by maximizing diversity (distance on log hazards)
-#       subject to fit thresholds, and ensuring both system types represented.
-# ------------------------------------------------------------------------------
-# Major differences from the original:
-# (1) parameters are a vector for easier optimization (this was a spec)
-# (2) functions separate from their usage and updating (this was a spec)
-# (3) ground world tweaked a bit
-# (4) world creation is 2-steps now. We first perturb parameters in different 
-#     directions using information from the svd of a jacobian of parameters on
-#     lx and prev... it's knarly I admit. This replaces parameter forcing in the 
-#     first version. THEN we optimize ALL parameters, but penalizing distance 
-#     from the original perturbation.
-# (5) then we keep worlds based on goodness of fit to prev and lx AND 
-#     diversity in resulting transitions.
-# (6) finally, rather than log linear hazards, I went with piecewise log linear
-#     just so that the no-returns worlds would fit prevalence a bit better.
-# We end up with 8 total worlds. Which could be called Octavio's Octet...
-library(dplyr)
-library(tidyr)
-library(purrr)
-library(ggplot2)
+# You should be able to run this script after sourcing simulation_functions.R.
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
 
 source("R/simulation_functions.R")
 
-# ---------
-# Top-level settings
-# ---------
+# -----------------------------------------------------------------------------
+# USER SETTINGS (keep these minimal)
+# -----------------------------------------------------------------------------
+age_int <- 1/12
+age     <- seq(50,100,by=age_int)
+init    <- c(H = 1, U = 0)
 
-age      <- 50:100
-age_int  <- 1
-knot_age <- 75 # for piecewise log linear hazards
-init     <- c(H=1, U=0) # just keep this simple
+# Hazard family for ground + candidates + polishing
+haz_shape   <- "softkink"   # "loglinear", "piecewise", "softkink"
+pivot_age   <- 70
+shape_width <- 6
 
-lambda      <- 0.3   # ridge toward each candidate (identity preservation)
-# smaller = better fit to lx and prev; larger (closer to 1)
-# respects the null direction parameters more.
-lambda_kink <- 1.0   # tame curvature: penalize (s2 - s1)^2; set 0 for fully free kink
-step_grid   <- c(-0.2, 0, 0.2) # how far to push parameters in null directions
+# Candidate stepping along null directions (NOTE: (0,0) excluded automatically)
+step_grid <- c(-0.3, -.1, .1, 0.3)   
+n_cores=parallel::detectCores()
+# Single-pass polishing controls
+lambda1 <- 0.3
+maxit1  <- 800
+factr1  <- 1e6
+w_lx    <- 0.5
+w_prev  <- 0.5
 
-# Fit thresholds used for winnowing down worlds 
-# (otherwise we end up with 18 of them)
-rmse_prev_max <- 4e-3    # 
-rmse_lx_max   <- 1.3e-3
+# Screening thresholds (optional; set to Inf to keep everything)
+rmse_prev_max <- Inf
+rmse_lx_max   <- Inf
 
-# How many final worlds?
-K_final <- 8
-K_noreturn_min <- 2
+# Exact snapping controls
+bounds_scalar <- c(1e-12, 2)
+turnover_K <- 1.2
+snap_tol  <- 1e-20
+line_tol  <- 1e-12
+eps_log   <- 1e-2
 
-# ---------
-# (1) Ground world (start linear, but we convert to piecewise with s2==s1)
-# We can choose a different ground world of course. I got these values by
-# eyeballing. I wanted prevalence to not end near 1. 
-
+# ---------------------------------------------------
+# 1) Ground world
+# ---------------------------------------------------
+# This arbitrary parameterization creates the ground world.
+# from here onward we try to match the sullivan stats
 ground_pars_vec <- c(
   i_hu = -5.5, i_hd = -8.5, i_uh = -1.5, i_ud = -4.5,
   s_hu =  0.06, s_hd =  0.10, s_uh = -0.07, s_ud =  0.07
 )
+ground_pars <- as_piecewise_pars(ground_pars_vec)
 
-# Convert to piecewise params (linear baseline: s2 == s1)
-ground_pars_pw <- as_piecewise_pars(ground_pars_vec)
+ground_mslt <- run_mslt(
+  ground_pars,
+  age = age, init = init, age_int = age_int,
+  haz_shape = haz_shape, pivot_age = pivot_age, shape_width = shape_width
+)
 
-# Ground Sullivan targets
-ground_mslt <- run_mslt(ground_pars_pw, 
-                        age = age, 
-                        init = init, 
-                        age_int = age_int, 
-                        knot_age = knot_age)
-ground_summary <- 
-  ground_mslt |> 
-  select(age, lx, prevalence)
+ground_summary <- ground_mslt |> select(age, lx, prevalence)
 
-# Quick check plot
+# Quick plot of targets
 ground_summary |>
-  pivot_longer(c(lx, prevalence), 
-               names_to = "Sullivan", 
-               values_to = "value") |>
-  ggplot(aes(age, value, color = Sullivan)) + 
-  geom_line() + 
-  labs(title = "Ground Sullivan outputs")
+  pivot_longer(c(lx, prevalence), names_to = "measure", values_to = "value") |>
+  ggplot(aes(age, value, color = measure)) +
+  geom_line() +
+  labs(title = "Ground Sullivan targets")
 
+# ---------------------------------------
+# 2) Null directions from Jacobian
+# ---------------------------------------
+free_names <- ms_par_names(piecewise = TRUE)
 
-# ---------
-# Helpers to generate + polish candidate worlds
-# ---------
-
-make_candidates <- function(base_pars, free_names, V2, grid_steps) {
-  grid <- expand.grid(h1 = grid_steps, h2 = grid_steps)
-  list(
-    grid = grid,
-    theta0 = pmap(grid, function(h1, h2) {
-      apply_directions(base_pars = base_pars, V = V2, steps = c(h1, h2), free_names = free_names)
-    })
-  )
-}
-
-polish_many <- function(theta0_list,
-                        ground_summary,
-                        free_polish,
-                        fixed = NULL,
-                        lambda = 0.3,
-                        lambda_kink = 0,
-                        slope_floor = 1e-6) {
-  
-  map(theta0_list, ~ polish_candidate_ridge(
-    theta_start = .x,
-    theta_target = .x,
-    ground_summary = ground_summary,
-    free_polish = free_polish,
-    fixed = fixed,
-    age = age,
-    init = init,
-    age_int = age_int,
-    knot_age = knot_age,
-    lambda = lambda,
-    lambda_kink = lambda_kink,
-    slope_floor = slope_floor,
-    maxit = 800
-  ))
-}
-
-stack_mslt <- function(theta_list, meta_df = NULL, system = NA_character_) {
-  imap_dfr(theta_list, function(th, i) {
-    out <- run_mslt(th, age=age, init=init, age_int=age_int, knot_age=knot_age) |>
-      mutate(pert = i, system = system)
-    if (!is.null(meta_df)) {
-      out <- out |>
-        mutate(h1 = meta_df$h1[i], h2 = meta_df$h2[i])
-    }
-    out
-  })
-}
-
-# ---------
-# (2) RETURNS system: find null directions and generate candidates
-# ---------
-
-free_returns <- ms_par_names(piecewise = TRUE)
-
-nd_ret <- find_null_directions(
-  base_pars  = ground_pars_pw,
-  free_names = free_returns,
-  age = age,
-  init = init,
-  age_int = age_int,
-  knot_age = knot_age,
+nd <- find_null_directions(
+  base_pars  = ground_pars,
+  free_names = free_names,
+  age = age, init = init, age_int = age_int,
+  haz_shape = haz_shape, pivot_age = pivot_age, shape_width = shape_width,
   outputs = c("lx","prevalence"),
-  tol = 1e-3,
-  eps = 1e-4
+  tol = 1e-3, eps = 1e-4
 )
 
-V2_ret <- nd_ret$directions[, 1:2, drop = FALSE]
+V2 <- nd$directions[, 1:2, drop = FALSE]
 
-cand_ret <- make_candidates(ground_pars_pw, free_returns, V2_ret, step_grid)
+# -------------------------------------------------------
+# 3) Candidate parameter sets along V2 (exclude (0,0))
+# -------------------------------------------------------
+cand <- make_candidates(
+  base_pars  = ground_pars,
+  free_names = free_names,
+  V2 = V2,
+  grid_steps = step_grid,
+  exclude_zero = TRUE
+)
 
-# Ridge polish (all params) with kink penalty to keep curvature minor
-theta_ret <- polish_many(
-  theta0_list = cand_ret$theta0,
+# ---------------------------------------------
+# 4) Single-pass polish
+# ---------------------------------------------
+theta_polished <- polish_many(
+  theta0_list = cand$theta0,
   ground_summary = ground_summary,
-  free_polish = free_returns,
-  fixed = NULL,
-  lambda = lambda,
-  lambda_kink = lambda_kink,
-  slope_floor = 1e-6
+  free_polish = free_names,
+  age = age, init = init, age_int = age_int,
+  haz_shape = haz_shape, pivot_age = pivot_age, shape_width = shape_width,
+  lambda = lambda1,
+  lambda2 = NULL,            # IMPORTANT: no 2nd stage
+  lambda_kink1 = 0,
+  kink_trans1 = character(0),
+  maxit1 = maxit1,
+  factr1 = factr1,
+  w_lx = w_lx,
+  w_prev = w_prev,
+  age_weight_lx = "none",
+  age_weight_prev = "none",
+  prev_band = NULL,
+  prev_band_mult = 1,
+  n_cores = n_cores
 )
 
-# ---------
-# (3) Select diverse RETURNS worlds (null directions + ridge polishing already done)
-# ---------
-
-fit_tab_ret <- purrr::imap_dfr(theta_ret, function(th, i) {
-  score_fit(th, ground_summary, age, init = init, age_int = age_int, knot_age = knot_age) |>
-    mutate(pert = i, system = "returns")
+fit_tbl <- purrr::imap_dfr(theta_polished, function(th, i){
+  score_fit(
+    th, ground_summary,
+    age = age, init = init, age_int = age_int,
+    haz_shape = haz_shape, pivot_age = pivot_age, shape_width = shape_width
+  ) |> mutate(world = i)
 })
 
-keep_ret <- fit_tab_ret |>
-  filter(rmse_lx <= rmse_lx_max, rmse_prev <= rmse_prev_max)
+keep_idx <- fit_tbl |>
+  filter(.data$rmse_lx <= rmse_lx_max, .data$rmse_prev <= rmse_prev_max) |>
+  pull(.data$world)
 
-keep_ids_ret <- keep_ret$pert
-theta_keep   <- theta_ret[keep_ids_ret]
-
-# Diversity distance on stacked log hazards (returns only)
-H_ret <- do.call(rbind, lapply(theta_keep, haz_matrix, age = age, age_int = age_int, knot_age = knot_age))
-D_ret <- as.matrix(dist(H_ret))
-
-# Greedy farthest-point selection (seed with the most central keep, i.e. medoid)
-seed <- if (nrow(D_ret) > 0) which.min(rowSums(D_ret)) else 1
-
-sel <- seed
-while (length(sel) < min(K_final, length(theta_keep))) {
-  mind <- apply(D_ret[, sel, drop = FALSE], 1, min)
-  mind[sel] <- -Inf
-  sel <- c(sel, which.max(mind))
+if(length(keep_idx) == 0){
+  warning("No polished worlds passed thresholds; keeping all.", call. = FALSE)
+  keep_idx <- seq_along(theta_polished)
 }
 
-theta_chosen <- theta_keep[sel]
+theta_keep <- theta_polished[keep_idx]
 
-# Hazards for chosen RETURNS worlds (this is the primary representation going forward)
-haz_chosen <-
-  imap_dfr(theta_chosen, function(th, i) {
-    expand_hazards(th, age = age, age_int = age_int, knot_age = knot_age) |>
-      mutate(world = i, system = "returns")
-  }) |>
-  arrange(world, trans, age)
-
-# Quick summary of fits for the chosen RETURNS worlds
-print(
-  keep_ret |>
-    mutate(world = match(pert, keep_ids_ret)) |>
-    filter(pert %in% keep_ids_ret[sel]) |>
-    arrange(rmse_prev)
-)
-
-# ---------
-# (4) NO-RETURNS worlds: derive hazards directly from hand-picked Rx patterns
-#     (no null-direction search / no optimization)
-# ---------
-
-# Plot Rx(age)=ud/hd for the chosen RETURNS worlds, then set the IDs below by eyeballing
-Rx_plot_df <-
-  haz_chosen |>
-  filter(trans %in% c("hd", "ud")) |>
-  pivot_wider(names_from = trans, values_from = hazard) |>
-  mutate(Rx = ud / hd)
-
-ggplot(Rx_plot_df, ggplot2::aes(x = age, y = Rx, color = as.factor(world))) +
-  geom_line(linewidth = 1.0) +
-  labs(color = "returns world", y = "Rx = ud/hd",
-       title = "Choose low/high Rx curves from RETURNS worlds") +
-  theme_minimal()
-
-# After eyeballing the plot, set:
-#   Rx_source_worlds = which RETURNS worlds provide Rx patterns (e.g., low/high)
-#   nr_world_ids     = which world IDs in the final set you want to become NO-RETURNS
-Rx_source_worlds <- c(3, 4)  # 
-nr_world_ids     <- c(1, 6)  # 
-
-stopifnot(length(Rx_source_worlds) == length(nr_world_ids))
-
-haz_nr_list <- map2(Rx_source_worlds, nr_world_ids, function(src_w, out_w) {
-  
-  Rx_vec <- Rx_plot_df |>
-    filter(world == src_w) |>
-    arrange(age) |>
-    pull(Rx)
-  
-  derive_noreturns_hazards(
-    age  = ground_summary$age,
-    lx   = ground_summary$lx,
-    prev = ground_summary$prevalence,
-    Rx   = Rx_vec,
-    age_int = age_int,
-    verbose = FALSE
+# Hazards for kept returns worlds (pass-1 polished)
+haz_ret_pass1 <- purrr::imap_dfr(theta_keep, function(th, j){
+  expand_hazards(
+    pars = th, age = age, age_int = age_int,
+    haz_shape = haz_shape, pivot_age = pivot_age, shape_width = shape_width
   ) |>
-    mutate(world = out_w, system = "noreturn")
+    mutate(world = keep_idx[j], system = "returns_pass1")
 })
 
-haz_nr <- bind_rows(haz_nr_list)
-
-# Replace those worlds with their no-return counterparts
-haz_chosen <-
-  haz_chosen |>
-  filter(!(system == "returns" & world %in% nr_world_ids)) |>
-  bind_rows(haz_nr) |>
-  arrange(world, trans, age)
-
-# ---------
-# (5) Sullivan outputs + plots + exports (hazards are primary)
-# ---------
-
-# Build lifetable outputs from hazards for ALL chosen worlds (returns and no-returns)
-lt_chosen <-
-  haz_chosen |>
-  group_split(world) |>
-  map_dfr(function(hz) {
-    w <- unique(hz$world)
-    sys <- unique(hz$system)
-    P <- haz_to_probs(hz |> select(age, trans, hazard), age = age, age_int = age_int)
-    calculate_lt(P, init = init) |>
-      mutate(world = w, system = sys)
-  })
-
-# Sullivan outputs
-lt_chosen |>
-  ggplot(aes(age, lx, group = world, color = as.factor(world))) +
-  geom_line(alpha = .75) +
-  geom_line(data = ground_summary, ggplot2::aes(age, lx),
-            inherit.aes = FALSE, linewidth = 1.1) +
-  labs(title = "lx: chosen worlds vs ground") +
-  theme_minimal()
-
-lt_chosen |>
-  ggplot(aes(age, prevalence, group = world, color = as.factor(world))) +
-  geom_line(alpha = .75) +
-  geom_line(data = ground_summary, ggplot2::aes(age, prevalence),
-            inherit.aes = FALSE, linewidth = 1.1) +
-  labs(title = "Prevalence: chosen worlds vs ground") +
-  theme_minimal()
-
-# Hazards (log scale)
-haz_chosen |>
-  filter(hazard > 1e-10) |> 
-  ggplot(aes(age, hazard, color = as.factor(world), linetype = system)) +
-  geom_line(alpha = .85) +
-  scale_y_log10() +
-  facet_wrap(~trans, scales = "free_y") +
-  labs(title = "Hazards by chosen worlds (includes no-returns)") +
-  theme_minimal()
-
-# Risk ratios
-haz_chosen |>
-  filter(trans %in% c("hd", "ud")) |>
+# -------------------------------
+# 5) Extract Rx = ud/hd
+# -------------------------------
+Rx_plot_df <- haz_ret_pass1 |>
+  filter(.data$trans %in% c("hd","ud")) |>
   pivot_wider(names_from = trans, values_from = hazard) |>
   mutate(Rx = ud / hd) |>
-  ggplot(aes(age, Rx, color = as.factor(world), linetype = system)) +
-  geom_line(linewidth = 1.1) +
-  labs(title = "Rx = ud/hd by world",
-       subtitle = "Note the no-returns RRs overlap other ones, as these were generative") +
-  theme_minimal()
+  select(age, world, Rx)
 
-# Save worlds
-write_csv(haz_chosen, "data/haz_octet.csv.gz")
+ggplot(Rx_plot_df, aes(age, Rx, color = as.factor(world))) +
+  geom_line() +
+  labs(color = "world", y = "Rx = ud/hd", title = "Rx curves from polished candidates")
+
+# ------------------------------------------------
+# 6) Exact RETURNS hazards by isocline snapping
+# ------------------------------------------------
+haz_returns_exact <- Rx_plot_df %>%
+  group_by(.data$world) %>%
+  group_modify(~{
+    w <- unique(.y$world)
+    Rx_vec <- .x %>% arrange(age) %>% pull(Rx)
+    
+    hz0 <- haz_ret_pass1 %>%
+      filter(.data$world == w, .data$trans %in% c("hu","uh")) %>%
+      arrange(.data$trans, .data$age)
+    
+    hu0 <- hz0 %>% filter(.data$trans == "hu") %>% pull(.data$hazard)
+    uh0 <- hz0 %>% filter(.data$trans == "uh") %>% pull(.data$hazard)
+    
+    derive_returns_hazards_from_Rx(
+      age  = ground_summary$age,
+      lx   = ground_summary$lx,
+      prev = ground_summary$prevalence,
+      Rx   = Rx_vec,
+      age_int = age_int,
+      bounds = bounds_scalar,
+      hu_bounds = NULL,
+      uh_bounds = NULL,
+      hu_0 = hu0,
+      uh_0 = uh0,
+      turnover_K = turnover_K,
+      snap_tol = snap_tol,
+      line_tol = line_tol,
+      eps_log = eps_log,
+      refine_tol = 1e-20,
+      verbose = FALSE
+    ) %>% mutate(system = "returns")
+  }) %>%
+  ungroup()
+
+# ------------------------------
+# 7) No-returns hazards
+# ------------------------------
+haz_noreturns <- Rx_plot_df %>%
+  group_by(.data$world) %>%
+  group_modify(~{
+    w <- unique(.y$world)
+    Rx_vec <- .x %>% arrange(age) %>% pull(Rx)
+    
+    derive_noreturns_hazards(
+      age  = ground_summary$age,
+      lx   = ground_summary$lx,
+      prev = ground_summary$prevalence,
+      Rx   = Rx_vec,
+      age_int = age_int,
+      verbose = FALSE
+    ) %>% mutate(system = "noreturns")
+  }) %>%
+  ungroup()
+
+haz_all <- bind_rows(haz_returns_exact, haz_noreturns)
+
+# -----------------------------------
+# 8) Lifetables from hazards 
+# -----------------------------------
+lt_all <- haz_all %>%
+  group_by(.data$world, .data$system) %>%
+  group_modify(~{
+    P <- haz_to_probs(.x %>% select(age, trans, hazard), age = age, age_int = age_int)
+    calculate_lt(P, init = init, age_int = age_int)
+  }) %>%
+  ungroup()
+
+
+lt_all |> 
+  ggplot(aes(x=age,y=prevalence,color=interaction(world,system))) +
+  geom_line()
+
+haz_all |> 
+  filter(!(trans=="uh" & system== "noreturns")) |> 
+  ggplot(aes(x=age,y=hazard,color=as.factor(world))) +
+  geom_line()+
+  scale_y_log10()+
+  facet_grid(vars(trans),vars(system),scale="free_y")
+  
+lt_all |> 
+  group_by(system,world) |> 
+  summarize(hle = sum(Lx * (1-prevalence))) |> 
+  pivot_wider(names_from = system, values_from = hle) |> 
+  pull(returns)
+
+readr::write_csv(haz_all, file = "data/worlds_hazards_monthly.csv.gz")
+readr::write_csv(lt_all, file = "data/worlds_mslt_monthly.csv.gz")
+
+
+
